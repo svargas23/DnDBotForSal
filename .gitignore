@@ -1,0 +1,9 @@
+node_modules/
+.env
+data/store.json
+npm-debug.log*
+logging/**/*.ndjson
+logging/**/*.txt
+logging/**/*.md
+logging/**/*.json
+!logging/.gitkeep
