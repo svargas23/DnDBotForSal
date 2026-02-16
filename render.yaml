@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: dnd-discord-bot
+    runtime: node
+    plan: starter
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DISCORD_CLIENT_ID
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: SUMMARY_MODEL
+        value: gpt-4o-mini
+      - key: TRANSCRIPTION_MODEL
+        value: whisper-1
+      - key: TRANSCRIPTION_LANGUAGE
+        value: en
+      - key: TRANSCRIPTION_PROMPT
+        value: "Fantasy Dungeons and Dragons terms. Character names and places should be preserved."
+      - key: MIN_AUDIO_BYTES
+        value: "30000"

@@ -13,7 +13,7 @@ function required(name) {
 export const config = {
   discordToken: required("DISCORD_BOT_TOKEN"),
   discordClientId: required("DISCORD_CLIENT_ID"),
-  discordGuildId: required("DISCORD_GUILD_ID"),
+  discordGuildId: process.env.DISCORD_GUILD_ID || "",
   openaiApiKey: required("OPENAI_API_KEY"),
   summaryModel: process.env.SUMMARY_MODEL || "gpt-4o-mini",
   transcriptionModel: process.env.TRANSCRIPTION_MODEL || "whisper-1",

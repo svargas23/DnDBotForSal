@@ -1,91 +1,113 @@
-# DnD Voice Notes Discord Bot (Local MVP)
+# DnD Voice Notes Discord Bot
 
-Quick-and-dirty Discord bot that:
-- joins your voice channel with `/session_start`
-- transcribes speech snippets with Whisper
-- generates lore-style campaign notes with `/dmnotes`
-- shows raw captured text with `/transcript`
-- clears saved note memory with `/reset_campaign`
-- finalizes with a narrative tale (and sometimes a next-segment hook) via `/session_end`
-- writes session and command logs under `logging/`
+A Discord bot for tabletop RPG groups that joins your voice channel, transcribes speech in real time with OpenAI Whisper, and generates lore-style campaign notes with GPT.
 
-## What You Need
+## Features
+
+- **Live voice transcription** — captures each speaker individually via silence-based chunking
+- **DM notes** (`/dmnotes`) — structured session notes with evidence tags from the transcript
+- **Session tales** (`/session_end`) — narrative after-session recap in DM storyteller voice
+- **Campaign continuity** — notes build on prior campaign state across sessions
+- **Transcript viewer** (`/transcript`) — raw captured lines with speaker names and timestamps
+- **Permission gating** — only Manage Server users can start/stop sessions and reset data
+- **Consent notice** — visible recording disclosure posted when a session begins
+- **Session logging** — full transcripts, summaries, and metadata saved per session
+
+## Slash Commands
+
+| Command | Permission | Description |
+|---|---|---|
+| `/session_start` | Manage Server | Join voice and start recording/transcribing |
+| `/session_end` | Manage Server | Stop recording and generate a session summary |
+| `/dmnotes` | Everyone | Generate structured DM notes from current transcript |
+| `/transcript` | Everyone | Show captured transcript lines |
+| `/reset_campaign` | Manage Server | Clear saved campaign state (confirmation required) |
+
+## Requirements
 
 - Node.js 20+
-- Discord bot token + app client ID + a test guild (server) ID
-- OpenAI API key (used for Whisper transcription and summary generation)
+- Discord bot token + application client ID
+- OpenAI API key
 
-## 1) Create and Configure Discord Bot
-
-In Discord Developer Portal:
-- Create application + bot user
-- Enable Gateway Intents:
-  - `GUILD VOICE STATES` (voice state intent is not a privileged toggle but is required by code)
-- OAuth2 URL scopes:
-  - `bot`
-  - `applications.commands`
-- Bot permissions (minimum):
-  - `Connect`
-  - `View Channels`
-  - `Use Application Commands`
-  - `Send Messages`
-
-Invite the bot to your test server.
-
-## 2) Local Setup
+## Setup
 
 ```bash
 npm install
 cp .env.example .env
 ```
 
-Fill `.env`:
+Fill in `.env`:
 - `DISCORD_BOT_TOKEN`
 - `DISCORD_CLIENT_ID`
-- `DISCORD_GUILD_ID`
 - `OPENAI_API_KEY`
+- `DISCORD_GUILD_ID` (optional — only needed for `--guild` dev registration)
 
-Register slash commands in your test server:
+### Register Commands
+
+**Global** (for production / marketplace — takes up to 1 hour to propagate):
 
 ```bash
 npm run register-commands
 ```
 
-Start bot:
+**Guild-scoped** (for development — takes effect instantly):
+
+```bash
+npm run register-commands:guild
+```
+
+### Start
 
 ```bash
 npm start
 ```
 
-## 3) Test Flow (Local)
+## Deploy to Render
 
-1. Join a voice channel in your Discord server.
-2. Run `/session_start`.
-3. Talk normally in the call.
-4. Run `/transcript` to confirm captured transcript lines.
-5. Run `/dmnotes` to get current campaign summary.
-6. Run `/session_end` to stop recording and persist final summary.
-7. If notes are polluted by old state, run `/reset_campaign`.
+1. Push this repo to GitHub.
+2. In Render, create a new **Blueprint** and connect your repo.
+3. Render will auto-detect `render.yaml` and configure the service.
+4. Set the required environment variables (`DISCORD_BOT_TOKEN`, `DISCORD_CLIENT_ID`, `OPENAI_API_KEY`) in Render's dashboard.
+5. Deploy. The bot will start and the health check endpoint will confirm it's alive.
 
-## Notes / Limitations
+Or manually create a **Web Service** with:
+- Build command: `npm ci`
+- Start command: `npm start`
+- Health check path: `/health`
 
-- Discord does not provide a direct transcript API. This bot captures live voice audio while connected.
-- The bot cannot transcribe voice from before `/session_start`.
-- Transcripts and campaign state are stored locally in `data/store.json`.
-- This MVP captures chunks per active speaker after short silence and sends each chunk to Whisper.
-- If lines are not appearing quickly, lower `MIN_AUDIO_BYTES` in `.env` (example: `15000`).
-- Improve STT consistency by setting:
-  - `TRANSCRIPTION_LANGUAGE=en`
-  - `TRANSCRIPTION_PROMPT` with your campaign's character/place names
-- Native opus decode is attempted via optional `@discordjs/opus` when available for better stability.
-- Keep this to private/test servers unless all participants consent to recording/transcription.
+## Environment Variables
 
-## Logging Output
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `DISCORD_BOT_TOKEN` | Yes | — | Bot token from Discord Developer Portal |
+| `DISCORD_CLIENT_ID` | Yes | — | Application client ID |
+| `OPENAI_API_KEY` | Yes | — | OpenAI API key |
+| `DISCORD_GUILD_ID` | No | — | Guild ID for dev-mode command registration |
+| `SUMMARY_MODEL` | No | `gpt-4o-mini` | GPT model for summaries |
+| `TRANSCRIPTION_MODEL` | No | `whisper-1` | Whisper model |
+| `TRANSCRIPTION_LANGUAGE` | No | `en` | Language hint for Whisper |
+| `TRANSCRIPTION_PROMPT` | No | D&D terms | Context prompt for Whisper |
+| `MIN_AUDIO_BYTES` | No | `30000` | Minimum audio chunk size |
+| `PORT` | No | `10000` | Health check HTTP port |
 
-Runtime logs are stored locally in:
-- `logging/command-responses.ndjson` (every command response)
-- `logging/sessions/<guild-id>/<session-id>/metadata.json`
-- `logging/sessions/<guild-id>/<session-id>/transcript.ndjson`
-- `logging/sessions/<guild-id>/<session-id>/transcript.txt`
-- `logging/sessions/<guild-id>/<session-id>/summary.md`
-- `logging/sessions/<guild-id>/<session-id>/session.json`
+## Data & Logging
+
+- Campaign state: `data/store.json`
+- Command logs: `logging/command-responses.ndjson`
+- Session logs: `logging/sessions/<guild-id>/<session-id>/`
+  - `metadata.json` — session metadata
+  - `transcript.ndjson` — machine-readable transcript
+  - `transcript.txt` — human-readable transcript
+  - `session.json` — full session payload
+  - `summary.md` — generated summary
+
+## Notes
+
+- The bot records voice only while a session is active (between `/session_start` and `/session_end`).
+- Audio is sent to OpenAI for transcription and is not stored after processing.
+- Keep this to private/consenting servers unless all participants agree to recording.
+
+## Legal
+
+- [Privacy Policy](PRIVACY_POLICY.md)
+- [Terms of Service](TERMS_OF_SERVICE.md)

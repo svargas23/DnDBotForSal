@@ -1,14 +1,18 @@
 {
   "name": "dnd-discord-bot",
-  "version": "0.1.0",
+  "version": "1.0.0",
+  "description": "A D&D voice-notes Discord bot that joins voice channels, transcribes speech via OpenAI Whisper, and generates lore-style campaign notes with GPT.",
   "private": true,
   "type": "module",
+  "license": "MIT",
+  "author": "Sal Vargas",
   "engines": {
     "node": ">=20.0.0"
   },
   "scripts": {
     "start": "node src/bot.js",
-    "register-commands": "node scripts/register-commands.js"
+    "register-commands": "node scripts/register-commands.js",
+    "register-commands:guild": "node scripts/register-commands.js --guild"
   },
   "dependencies": {
     "@discordjs/voice": "^0.18.0",

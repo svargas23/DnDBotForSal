@@ -1,6 +1,11 @@
 import {
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
   Client,
-  GatewayIntentBits
+  ComponentType,
+  GatewayIntentBits,
+  PermissionFlagsBits
 } from "discord.js";
 import {
   EndBehaviorType,
@@ -9,6 +14,7 @@ import {
   joinVoiceChannel
 } from "@discordjs/voice";
 import prism from "prism-media";
+import http from "node:http";
 import { config } from "./config.js";
 import { createSessionSummaryTale, transcribeWav, summarizeDmNotes } from "./ai.js";
 import { pcmToWav } from "./audio.js";
@@ -20,7 +26,7 @@ import {
   initSessionLogs,
   logCommandResponse
 } from "./logging.js";
-import { getGuildState, loadStore, saveStore } from "./store.js";
+import { getGuildState, withStore, readStore } from "./store.js";
 
 const client = new Client({
   intents: [
@@ -62,6 +68,13 @@ async function sendEditReply(interaction, commandName, text, metadata = {}) {
   });
 }
 
+function requireManageGuild(interaction) {
+  if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+    return "You need the **Manage Server** permission to use this command.";
+  }
+  return null;
+}
+
 async function resolveSpeakerName(guildId, userId) {
   const guild = client.guilds.cache.get(guildId);
   if (!guild) return userId;
@@ -73,9 +86,6 @@ async function resolveSpeakerName(guildId, userId) {
 
 async function appendTranscriptLine(guildId, userId, text) {
   const speaker = await resolveSpeakerName(guildId, userId);
-  const store = await loadStore();
-  const guildState = getGuildState(store, guildId);
-  if (!guildState.currentSession?.active) return;
 
   const transcriptLine = {
     timestamp: discordTimestamp(),
@@ -83,14 +93,21 @@ async function appendTranscriptLine(guildId, userId, text) {
     speaker,
     text
   };
-  guildState.currentSession.transcript.push(transcriptLine);
-  await saveStore(store);
+
+  const sessionId = await withStore((store) => {
+    const guildState = getGuildState(store, guildId);
+    if (!guildState.currentSession?.active) return null;
+    guildState.currentSession.transcript.push(transcriptLine);
+    return guildState.currentSession.sessionId;
+  });
+
+  if (sessionId === null) return;
 
   try {
-    if (guildState.currentSession.sessionId) {
+    if (sessionId) {
       await appendSessionTranscriptLine({
         guildId,
-        sessionId: guildState.currentSession.sessionId,
+        sessionId,
         line: transcriptLine
       });
     }
@@ -107,6 +124,9 @@ function isIgnorableStreamError(error) {
   const message = String(error.message || "");
   return message.includes("stream.push() after EOF");
 }
+
+// ~60 seconds of 48kHz stereo 16-bit PCM.
+const MAX_PCM_BYTES = 48000 * 2 * 2 * 60;
 
 function startReceiverForGuild(guildId, connection) {
   const runtime = {
@@ -135,6 +155,7 @@ function startReceiverForGuild(guildId, connection) {
       opusStream,
       decoder,
       pcmChunks: [],
+      pcmByteCount: 0,
       finished: false
     };
 
@@ -170,7 +191,14 @@ function startReceiverForGuild(guildId, connection) {
       }
     };
 
-    decoder.on("data", (chunk) => state.pcmChunks.push(chunk));
+    decoder.on("data", (chunk) => {
+      state.pcmChunks.push(chunk);
+      state.pcmByteCount += chunk.length;
+      // If we hit the buffer cap, flush immediately instead of waiting for silence.
+      if (state.pcmByteCount >= MAX_PCM_BYTES) {
+        void finalize("buffer_cap");
+      }
+    });
     decoder.once("end", () => {
       void finalize("decoder_end");
     });
@@ -215,6 +243,40 @@ async function stopReceiverForGuild(guildId) {
   activeVoiceSessions.delete(guildId);
 }
 
+/**
+ * Attach reconnect handling to a voice connection.
+ * On disconnect, attempt to reconnect within 5 seconds.
+ * On permanent failure, notify the text channel and clean up.
+ */
+function attachReconnectHandler(guildId, connection, textChannelId) {
+  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    try {
+      // Try to reconnect within 5 seconds.
+      await Promise.race([
+        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+        entersState(connection, VoiceConnectionStatus.Connecting, 5_000)
+      ]);
+      // Reconnection in progress — voice library handles it from here.
+    } catch {
+      // Permanent disconnect — clean up.
+      console.error(`[${guildId}] Voice connection lost permanently.`);
+      await stopReceiverForGuild(guildId);
+
+      // Notify channel if possible.
+      try {
+        const channel = client.channels.cache.get(textChannelId);
+        if (channel?.isTextBased()) {
+          await channel.send(
+            "⚠️ Voice connection lost. The recording session has been stopped. Use `/session_end` to save any captured transcript, then `/session_start` to begin a new session."
+          );
+        }
+      } catch (notifyError) {
+        console.error("Failed to send disconnect notice:", notifyError);
+      }
+    }
+  });
+}
+
 async function replyLong(interaction, commandName, text, metadata = {}) {
   const chunks = chunkDiscordMessage(text);
   if (!interaction.replied && !interaction.deferred) {
@@ -253,6 +315,12 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
 
+      const permError = requireManageGuild(interaction);
+      if (permError) {
+        await sendReply(interaction, "session_start", permError);
+        return;
+      }
+
       const voiceChannel = interaction.member?.voice?.channel;
       if (!voiceChannel) {
         await sendReply(
@@ -278,19 +346,22 @@ client.on("interactionCreate", async (interaction) => {
 
       await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
       startReceiverForGuild(interaction.guildId, connection);
+      attachReconnectHandler(interaction.guildId, connection, interaction.channelId);
 
-      const store = await loadStore();
-      const guildState = getGuildState(store, interaction.guildId);
       const startedAt = new Date().toISOString();
       const sessionId = buildSessionId(startedAt);
-      guildState.currentSession = {
-        sessionId,
-        active: true,
-        startedAt,
-        voiceChannelId: voiceChannel.id,
-        transcript: []
-      };
-      await saveStore(store);
+
+      await withStore((store) => {
+        const guildState = getGuildState(store, interaction.guildId);
+        guildState.currentSession = {
+          sessionId,
+          active: true,
+          startedAt,
+          voiceChannelId: voiceChannel.id,
+          transcript: []
+        };
+      });
+
       try {
         await initSessionLogs({
           guildId: interaction.guildId,
@@ -305,7 +376,7 @@ client.on("interactionCreate", async (interaction) => {
       await sendReply(
         interaction,
         "session_start",
-        `Session started in **${voiceChannel.name}**. I am now recording and transcribing voice snippets.`,
+        `Session started in **${voiceChannel.name}**. I am now recording and transcribing voice snippets.\n\n⚠️ **Notice:** Voice in this channel is being recorded and transcribed. Audio is processed via OpenAI's Whisper API and is not stored after transcription.`,
         { sessionId }
       );
       return;
@@ -317,48 +388,68 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
 
+      const permError = requireManageGuild(interaction);
+      if (permError) {
+        await sendReply(interaction, "session_end", permError);
+        return;
+      }
+
       await interaction.deferReply();
       await stopReceiverForGuild(interaction.guildId);
 
-      const store = await loadStore();
-      const guildState = getGuildState(store, interaction.guildId);
-      const session = guildState.currentSession;
+      // Read current session snapshot.
+      const sessionSnapshot = await withStore((store) => {
+        const guildState = getGuildState(store, interaction.guildId);
+        const session = guildState.currentSession;
+        if (!session?.active) return null;
+        // Return a copy so we can do async GPT work outside the lock.
+        return {
+          sessionId: session.sessionId || buildSessionId(session.startedAt),
+          startedAt: session.startedAt,
+          transcript: [...session.transcript],
+          campaignState: guildState.campaignState
+        };
+      });
 
-      if (!session?.active) {
+      if (!sessionSnapshot) {
         await sendEditReply(interaction, "session_end", "No active session exists.");
         return;
       }
 
+      const { sessionId, startedAt, transcript, campaignState } = sessionSnapshot;
       const includeNextSegmentHint = Math.random() < 0.4;
       const summary = await createSessionSummaryTale({
-        campaignState: guildState.campaignState,
-        transcriptLines: session.transcript,
+        campaignState,
+        transcriptLines: transcript,
         includeNextSegmentHint
       });
-      const hasTranscript = session.transcript.length > 0;
+      const hasTranscript = transcript.length > 0;
       const endedAt = new Date().toISOString();
-      const sessionId = session.sessionId || buildSessionId(session.startedAt);
 
-      guildState.history.unshift({
-        startedAt: session.startedAt,
-        endedAt,
-        transcriptCount: session.transcript.length,
-        transcript: session.transcript,
-        sessionId,
-        summary
+      // Commit final state under the lock.
+      await withStore((store) => {
+        const guildState = getGuildState(store, interaction.guildId);
+        guildState.history.unshift({
+          startedAt,
+          endedAt,
+          transcriptCount: transcript.length,
+          transcript,
+          sessionId,
+          summary
+        });
+        if (hasTranscript) {
+          guildState.campaignState = summary;
+        }
+        guildState.currentSession = null;
       });
-      if (hasTranscript) {
-        guildState.campaignState = summary;
-      }
-      guildState.currentSession = null;
-      await saveStore(store);
+
       try {
         await finalizeSessionLogs({
           guildId: interaction.guildId,
           sessionId,
-          startedAt: session.startedAt,
+          startedAt,
           endedAt,
-          transcript: session.transcript,
+          transcript,
           summary
         });
       } catch (error) {
@@ -367,12 +458,12 @@ client.on("interactionCreate", async (interaction) => {
 
       await sendEditReply(interaction, "session_end", "Session ended. Compiling final notes...", {
         sessionId,
-        transcriptCount: session.transcript.length,
+        transcriptCount: transcript.length,
         includeNextSegmentHint
       });
       await replyLong(interaction, "session_end", `# Session Summary\n\n${summary}`, {
         sessionId,
-        transcriptCount: session.transcript.length,
+        transcriptCount: transcript.length,
         includeNextSegmentHint
       });
       return;
@@ -385,15 +476,17 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       await interaction.deferReply();
-      const store = await loadStore();
-      const guildState = getGuildState(store, interaction.guildId);
-      const transcriptLines = guildState.currentSession?.transcript || [];
 
-      const notes = await summarizeDmNotes({
-        campaignState: guildState.campaignState,
-        transcriptLines
+      const snapshot = await readStore().then((store) => {
+        const guildState = getGuildState(store, interaction.guildId);
+        return {
+          campaignState: guildState.campaignState,
+          transcriptLines: guildState.currentSession?.transcript || []
+        };
       });
-      const transcriptCount = transcriptLines.length;
+
+      const notes = await summarizeDmNotes(snapshot);
+      const transcriptCount = snapshot.transcriptLines.length;
 
       await sendEditReply(interaction, "dmnotes", "Compiling dungeon master notes...", {
         transcriptCount
@@ -413,16 +506,67 @@ client.on("interactionCreate", async (interaction) => {
         return;
       }
 
-      const store = await loadStore();
-      const guildState = getGuildState(store, interaction.guildId);
-      guildState.campaignState = "";
-      await saveStore(store);
+      const permError = requireManageGuild(interaction);
+      if (permError) {
+        await sendReply(interaction, "reset_campaign", permError);
+        return;
+      }
 
-      await sendReply(
-        interaction,
-        "reset_campaign",
-        "Saved campaign state cleared. Future notes will be based on new transcript lines."
-      );
+      const confirmButton = new ButtonBuilder()
+        .setCustomId("confirm_reset_campaign")
+        .setLabel("Yes, reset campaign")
+        .setStyle(ButtonStyle.Danger);
+
+      const cancelButton = new ButtonBuilder()
+        .setCustomId("cancel_reset_campaign")
+        .setLabel("Cancel")
+        .setStyle(ButtonStyle.Secondary);
+
+      const row = new ActionRowBuilder().addComponents(confirmButton, cancelButton);
+
+      const confirmMsg = await interaction.reply({
+        content: "\u26a0\ufe0f **Are you sure?** This will permanently clear all saved campaign state. Session history and logs are not affected.",
+        components: [row],
+        fetchReply: true
+      });
+
+      try {
+        const buttonPress = await confirmMsg.awaitMessageComponent({
+          componentType: ComponentType.Button,
+          filter: (i) => i.user.id === interaction.user.id,
+          time: 30_000
+        });
+
+        if (buttonPress.customId === "confirm_reset_campaign") {
+          await withStore((store) => {
+            const guildState = getGuildState(store, interaction.guildId);
+            // Backup before clearing.
+            if (guildState.campaignState) {
+              guildState.lastCampaignBackup = guildState.campaignState;
+            }
+            guildState.campaignState = "";
+          });
+
+          await buttonPress.update({
+            content: "\u2705 Campaign state cleared. Future notes will be based on new transcript lines.",
+            components: []
+          });
+          await logInteractionResponse(interaction, "reset_campaign", "Campaign state cleared (confirmed).");
+        } else {
+          await buttonPress.update({
+            content: "Reset cancelled.",
+            components: []
+          });
+          await logInteractionResponse(interaction, "reset_campaign", "Reset cancelled by user.");
+        }
+      } catch {
+        // Timeout — no button pressed within 30 seconds.
+        await interaction.editReply({
+          content: "Reset timed out (no response within 30 seconds). Campaign state was not changed.",
+          components: []
+        });
+        await logInteractionResponse(interaction, "reset_campaign", "Reset timed out.");
+      }
       return;
     }
 
@@ -433,13 +577,19 @@ client.on("interactionCreate", async (interaction) => {
       }
 
       await interaction.deferReply();
-      const store = await loadStore();
-      const guildState = getGuildState(store, interaction.guildId);
-      const transcriptLines = guildState.currentSession?.transcript || [];
-      const activeSession = Boolean(guildState.currentSession?.active);
-      const fallbackHistoryLines = !activeSession
-        ? guildState.history?.[0]?.transcript || []
-        : [];
+
+      const snapshot = await readStore().then((store) => {
+        const guildState = getGuildState(store, interaction.guildId);
+        return {
+          transcriptLines: guildState.currentSession?.transcript || [],
+          activeSession: Boolean(guildState.currentSession?.active),
+          fallbackHistoryLines: !guildState.currentSession?.active
+            ? guildState.history?.[0]?.transcript || []
+            : []
+        };
+      });
+
+      const { transcriptLines, activeSession, fallbackHistoryLines } = snapshot;
       const effectiveLines = transcriptLines.length ? transcriptLines : fallbackHistoryLines;
       const usingLastSession = !transcriptLines.length && Boolean(fallbackHistoryLines.length);
 
@@ -509,5 +659,18 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
     process.exit(0);
   });
 }
+
+process.on("unhandledRejection", (error) => {
+  console.error("Unhandled promise rejection:", error);
+});
+
+// Tiny HTTP server for Render health checks.
+const healthPort = Number(process.env.PORT) || 10000;
+http.createServer((_req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("OK");
+}).listen(healthPort, () => {
+  console.log(`Health check listening on port ${healthPort}`);
+});
 
 client.login(config.discordToken);

@@ -3,21 +3,80 @@ import { config } from "./config.js";
 
 const openai = new OpenAI({ apiKey: config.openaiApiKey });
 
+// ---------------------------------------------------------------------------
+// Concurrency limiter – max 3 simultaneous Whisper calls.
+// ---------------------------------------------------------------------------
+const MAX_CONCURRENT_TRANSCRIPTIONS = 3;
+let _activeTranscriptions = 0;
+const _queue = [];
+
+function _runNextInQueue() {
+  while (_queue.length > 0 && _activeTranscriptions < MAX_CONCURRENT_TRANSCRIPTIONS) {
+    const { resolve } = _queue.shift();
+    _activeTranscriptions += 1;
+    resolve();
+  }
+}
+
+async function _acquireSlot() {
+  if (_activeTranscriptions < MAX_CONCURRENT_TRANSCRIPTIONS) {
+    _activeTranscriptions += 1;
+    return;
+  }
+  await new Promise((resolve) => _queue.push({ resolve }));
+}
+
+function _releaseSlot() {
+  _activeTranscriptions -= 1;
+  _runNextInQueue();
+}
+
+// ---------------------------------------------------------------------------
+// Retry helper – retries on 429 / 500 / 503 with exponential backoff.
+// ---------------------------------------------------------------------------
+async function withRetry(fn, { retries = 2, baseDelayMs = 1000 } = {}) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      const status = error?.status || error?.response?.status;
+      const isRetryable = [429, 500, 503].includes(status);
+      if (!isRetryable || attempt >= retries) throw error;
+      const delay = baseDelayMs * 2 ** attempt;
+      console.warn(`Retryable API error (${status}), retrying in ${delay}ms (attempt ${attempt + 1}/${retries})...`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Transcript text helper.
+// ---------------------------------------------------------------------------
 function toTranscriptText(transcriptLines) {
   return transcriptLines
     .map((line, index) => `L${index + 1} [${line.timestamp}] ${line.speaker}: ${line.text}`)
     .join("\n");
 }
 
+// ---------------------------------------------------------------------------
+// Public API.
+// ---------------------------------------------------------------------------
 export async function transcribeWav(wavBuffer, fileName = "speech.wav") {
-  const file = await toFile(wavBuffer, fileName, { type: "audio/wav" });
-  const response = await openai.audio.transcriptions.create({
-    model: config.transcriptionModel,
-    file,
-    language: config.transcriptionLanguage,
-    prompt: config.transcriptionPrompt || undefined
-  });
-  return response.text?.trim() || "";
+  await _acquireSlot();
+  try {
+    return await withRetry(async () => {
+      const file = await toFile(wavBuffer, fileName, { type: "audio/wav" });
+      const response = await openai.audio.transcriptions.create({
+        model: config.transcriptionModel,
+        file,
+        language: config.transcriptionLanguage,
+        prompt: config.transcriptionPrompt || undefined
+      });
+      return response.text?.trim() || "";
+    });
+  } finally {
+    _releaseSlot();
+  }
 }
 
 export async function summarizeDmNotes({ campaignState, transcriptLines }) {
@@ -51,12 +110,13 @@ export async function summarizeDmNotes({ campaignState, transcriptLines }) {
     transcriptText || "(none)"
   ].join("\n");
 
-  const response = await openai.responses.create({
-    model: config.summaryModel,
-    input: prompt
+  return await withRetry(async () => {
+    const response = await openai.responses.create({
+      model: config.summaryModel,
+      input: prompt
+    });
+    return response.output_text?.trim() || "I could not generate notes from the current transcript.";
   });
-
-  return response.output_text?.trim() || "I could not generate notes from the current transcript.";
 }
 
 export async function createSessionSummaryTale({
@@ -96,10 +156,11 @@ export async function createSessionSummaryTale({
     transcriptText
   ].join("\n");
 
-  const response = await openai.responses.create({
-    model: config.summaryModel,
-    input: prompt
+  return await withRetry(async () => {
+    const response = await openai.responses.create({
+      model: config.summaryModel,
+      input: prompt
+    });
+    return response.output_text?.trim() || "I could not craft a session tale from the transcript.";
   });
-
-  return response.output_text?.trim() || "I could not craft a session tale from the transcript.";
 }
